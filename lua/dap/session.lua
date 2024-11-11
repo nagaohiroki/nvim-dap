@@ -1007,7 +1007,7 @@ function Session:set_exception_breakpoints(filters, exceptionOptions, on_done)
   --- exceptionOptions: exceptionOptions?: ExceptionOptions[] (https://microsoft.github.io/debug-adapter-protocol/specification#Types_ExceptionOptions)
   self:request(
     'setExceptionBreakpoints',
-    { filters = filters, exceptionOptions = exceptionOptions },
+    { filters = filters, exceptionOptions = exceptionOptions, filterOptions = {} },
     function(err, _)
       if err then
         utils.notify('Error setting exception breakpoints: ' .. utils.fmt_error(err), vim.log.levels.ERROR)
