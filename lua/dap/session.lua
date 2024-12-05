@@ -1204,7 +1204,7 @@ local function new_session(adapter, opts, handle)
     stopped_thread_id = nil,
     current_frame = nil,
     threads = {},
-    adapter = adapter,
+    adapter = vim.deepcopy(adapter),
     dirty = {},
     capabilities = {},
     filetype = opts.filetype or vim.bo.filetype,
@@ -1316,12 +1316,12 @@ function Session.pipe(adapter, opts, on_connect)
   local pipe = assert(uv.new_pipe(), "Must be able to create pipe")
   local session = new_session(adapter, opts or {}, pipe)
 
+  local session_adapter = session.adapter
+  ---@cast session_adapter dap.PipeAdapter
+  adapter = session_adapter
+
   if adapter.executable then
     if adapter.pipe == "${pipe}" then
-      -- don't mutate original adapter definition
-      adapter = vim.deepcopy(adapter)
-      session.adapter = adapter
-
       local filepath = os.tmpname()
       os.remove(filepath)
       session.on_close["dap.server_executable_pipe"] = function()
@@ -1370,15 +1370,18 @@ function Session.pipe(adapter, opts, on_connect)
 end
 
 
+---@param adapter dap.ServerAdapter
 function Session.connect(_, adapter, opts, on_connect)
   local client = assert(uv.new_tcp(), "Must be able to create TCP client")
   local session = new_session(adapter, opts or {}, client)
 
+  local session_adapter = session.adapter
+  ---@cast session_adapter dap.ServerAdapter
+  adapter = session_adapter
+
   if adapter.executable then
     if adapter.port == "${port}" then
       local port = get_free_port()
-      -- don't mutate original adapter definition
-      adapter = vim.deepcopy(adapter)
       session.adapter = adapter
       adapter.port = port
       if adapter.executable.args then
@@ -1470,12 +1473,7 @@ function Session.spawn(_, adapter, opts)
   local pid_or_err
   local closed = false
 
-  local function onexit(cb)
-    if closed then
-      return
-    end
-    cb = cb or function() end
-    closed = true
+  local function sigint(cb)
     if not handle or handle:is_closing() then
       cb()
       return
@@ -1499,6 +1497,21 @@ function Session.spawn(_, adapter, opts)
     end)
   end
 
+  local function onexit(cb)
+    if closed then
+      return
+    end
+    cb = cb or function() end
+    closed = true
+    if stdin:is_closing() then
+      sigint(cb)
+    else
+      stdin:close(function()
+        sigint(cb)
+      end)
+    end
+  end
+
   local options = adapter.options or {}
   local spawn_opts = {
     args = adapter.args;
@@ -1509,9 +1522,6 @@ function Session.spawn(_, adapter, opts)
   }
   local session
   handle, pid_or_err = uv.spawn(adapter.command, spawn_opts, function(code)
-    stdin:close()
-    stdout:close()
-    stderr:close()
     onexit()
     log.info('Process closed', pid_or_err)
     if code ~= 0 then
@@ -1534,13 +1544,20 @@ function Session.spawn(_, adapter, opts)
   end
   session = new_session(adapter, opts or {}, stdin)
   session.client.close = onexit
-  stdout:read_start(rpc.create_read_loop(vim.schedule_wrap(function(body)
+
+  local function on_body(body)
     session:handle_body(body)
-  end)))
+  end
+  local function on_eof()
+    stdout:close()
+  end
+  stdout:read_start(rpc.create_read_loop(vim.schedule_wrap(on_body), on_eof))
   stderr:read_start(function(err, chunk)
     assert(not err, err)
     if chunk then
       log.error("stderr", adapter, chunk)
+    else
+      stderr:close()
     end
   end)
   return session

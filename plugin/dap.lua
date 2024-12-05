@@ -24,7 +24,6 @@ cmd('DapStepInto', function() require('dap').step_into() end, { nargs = 0 })
 cmd('DapStepOut', function() require('dap').step_out() end, { nargs = 0 })
 cmd('DapTerminate', function() require('dap').terminate() end, { nargs = 0 })
 cmd('DapDisconnect', function() require('dap').disconnect({ terminateDebuggee = false }) end, { nargs = 0 })
-cmd('DapLoadLaunchJSON', function() require('dap.ext.vscode').load_launchjs() end, { nargs = 0 })
 cmd('DapRestartFrame', function() require('dap').restart_frame() end, { nargs = 0 })
 
 local function dapnew(args)
@@ -56,20 +55,7 @@ if api.nvim_create_autocmd then
     group = launchjson_group,
     pattern = pattern,
     callback = function(args)
-      local lines = {
-        '{',
-        '   "$schema": "https://raw.githubusercontent.com/mfussenegger/dapconfig-schema/master/dapconfig-schema.json",',
-        '   "version": "0.2.0",',
-        '   "configurations": [',
-        '       {',
-        '           "type": "<adapter-name>",',
-        '           "request": "launch",',
-        '           "name": "Launch"',
-        '       }',
-        '   ]',
-        '}'
-      }
-      api.nvim_buf_set_lines(args.buf, 0, -1, true, lines)
+      require("dap._cmds").newlaunchjson(args)
     end
   })
 
