@@ -14,6 +14,12 @@ local mime_to_filetype = {
   ['text/javascript'] = 'javascript'
 }
 
+local err_mt = {
+  __tostring = function(e)
+    return utils.fmt_error(e)
+  end,
+}
+
 
 local ns_pool = {}
 do
@@ -318,7 +324,7 @@ function Session:event_initialized()
     if self.capabilities.supportsConfigurationDoneRequest then
       self:request('configurationDone', nil, function(err1, _)
         if err1 then
-          utils.notify(utils.fmt_error(err1), vim.log.levels.ERROR)
+          utils.notify(tostring(err1), vim.log.levels.ERROR)
         end
         self.initialized = true
       end)
@@ -347,7 +353,7 @@ function Session:_show_exception_info(thread_id, bufnr, frame)
   end
   local err, response = self:request('exceptionInfo', {threadId = thread_id})
   if err then
-    utils.notify('Error getting exception info: ' .. utils.fmt_error(err), vim.log.levels.ERROR)
+    utils.notify('Error getting exception info: ' .. tostring(err), vim.log.levels.ERROR)
   end
   if not response then
     return
@@ -704,7 +710,7 @@ function Session:event_stopped(stopped)
       self:update_threads(coresume(co))
       local err = coroutine.yield()
       if err then
-        utils.notify('Error retrieving threads: ' .. utils.fmt_error(err), vim.log.levels.ERROR)
+        utils.notify('Error retrieving threads: ' .. tostring(err), vim.log.levels.ERROR)
         return
       end
       if thread.stopped == false then
@@ -767,7 +773,7 @@ function Session:event_stopped(stopped)
       return
     end
     if err then
-      utils.notify('Error retrieving stack traces: ' .. utils.fmt_error(err), vim.log.levels.ERROR)
+      utils.notify('Error retrieving stack traces: ' .. tostring(err), vim.log.levels.ERROR)
       return
     end
     local frames = response.stackFrames --[=[@as dap.StackFrame[]]=]
@@ -879,7 +885,7 @@ function Session:_goto(line, source, col)
   coroutine.wrap(function()
     local err, response = self:request('gotoTargets',  {source = source or frame.source, line = line, col = col})
     if err then
-      utils.notify('Error getting gotoTargets: ' .. utils.fmt_error(err), vim.log.levels.ERROR)
+      utils.notify('Error getting gotoTargets: ' .. tostring(err), vim.log.levels.ERROR)
       return
     end
     if not response or not response.targets then
@@ -904,7 +910,7 @@ function Session:_goto(line, source, col)
       if thread then
         thread.stopped = true
       end
-      utils.notify('Error executing goto: ' .. utils.fmt_error(goto_err), vim.log.levels.ERROR)
+      utils.notify('Error executing goto: ' .. tostring(goto_err), vim.log.levels.ERROR)
     end
   end)()
 end
@@ -976,7 +982,7 @@ do
       ---@param resp dap.SetBreakpointsResponse
       local function on_response(err1, resp)
         if err1 then
-          utils.notify('Error setting breakpoints: ' .. utils.fmt_error(err1), vim.log.levels.ERROR)
+          utils.notify('Error setting breakpoints: ' .. tostring(err1), vim.log.levels.ERROR)
         elseif resp then
           for _, bp in pairs(resp.breakpoints) do
             breakpoints.set_state(bufnr, bp)
@@ -1033,12 +1039,23 @@ function Session:set_exception_breakpoints(filters, exceptionOptions, on_done)
     { filters = filters, exceptionOptions = exceptionOptions, filterOptions = {} },
     function(err, _)
       if err then
-        utils.notify('Error setting exception breakpoints: ' .. utils.fmt_error(err), vim.log.levels.ERROR)
+        utils.notify('Error setting exception breakpoints: ' .. tostring(err), vim.log.levels.ERROR)
       end
       if on_done then
         on_done()
       end
   end)
+end
+
+
+---@param listeners table<string, dap.RequestListener<any>|dap.EventListener<any>>
+local function call_listener(listeners, ...)
+  for key, listener in pairs(listeners) do
+    local remove = listener(...)
+    if remove then
+      listeners[key] = nil
+    end
+  end
 end
 
 
@@ -1055,45 +1072,36 @@ function Session:handle_body(body)
       log:error('No callback found. Did the debug adapter send duplicate responses?', decoded)
       return
     end
+    local err = nil
+    local response = nil
     if decoded.success then
-      vim.schedule(function()
-        for _, c in pairs(listeners.before[decoded.command]) do
-          c(self, nil, decoded.body, request, decoded.request_seq)
-        end
-        callback(nil, decoded.body, decoded.request_seq)
-        for _, c in pairs(listeners.after[decoded.command]) do
-          c(self, nil, decoded.body, request, decoded.request_seq)
-        end
-      end)
+      response = decoded.body
     else
-      vim.schedule(function()
-        local err = { message = decoded.message; body = decoded.body; }
-        for _, c in pairs(listeners.before[decoded.command]) do
-          c(self, err, nil, request, decoded.request_seq)
-        end
-        callback(err, nil, decoded.request_seq)
-        for _, c in pairs(listeners.after[decoded.command]) do
-          c(self, err, nil, request, decoded.request_seq)
-        end
-      end)
+      err = {
+        message = decoded.message,
+        body = decoded.body,
+      }
+      setmetatable(err, err_mt)
     end
-  elseif decoded.event then
-    local callback = self['event_' .. decoded.event]
     vim.schedule(function()
-      local event_handled = false
-      for _, c in pairs(listeners.before['event_' .. decoded.event]) do
-        event_handled = true
-        c(self, decoded.body)
-      end
+      local before = listeners.before[decoded.command]
+      call_listener(before, self, err, response, request, decoded.request_seq)
+      callback(err, decoded.body, decoded.request_seq)
+      local after = listeners.after[decoded.command]
+      call_listener(after, self, err, response, request, decoded.request_seq)
+    end)
+  elseif decoded.event then
+    local callback_name = "event_" .. decoded.event
+    local callback = self[callback_name]
+    vim.schedule(function()
+      local before = listeners.before[callback_name]
+      call_listener(before, self, decoded.body)
       if callback then
-        event_handled = true
         callback(self, decoded.body)
       end
-      for _, c in pairs(listeners.after['event_' .. decoded.event]) do
-        event_handled = true
-        c(self, decoded.body)
-      end
-      if not event_handled then
+      local after = listeners.after[callback_name]
+      call_listener(after, self, decoded.body)
+      if not callback and not next(before) and not next(after) then
         log:warn('No event handler for ', decoded)
       end
     end)
@@ -1628,7 +1636,7 @@ local function pause_thread(session, thread_id, cb)
 
   session:request('pause', { threadId = thread_id; }, function(err)
     if err then
-      utils.notify('Error pausing: ' .. utils.fmt_error(err), vim.log.levels.ERROR)
+      utils.notify('Error pausing: ' .. tostring(err), vim.log.levels.ERROR)
     else
       utils.notify('Thread paused ' .. thread_id, vim.log.levels.INFO)
       local thread = session.threads[thread_id]
@@ -1651,7 +1659,7 @@ function Session:_pause(thread_id, cb)
   if self.dirty.threads then
     self:update_threads(function(err)
       if err then
-        utils.notify('Error requesting threads: ' .. utils.fmt_error(err), vim.log.levels.ERROR)
+        utils.notify('Error requesting threads: ' .. tostring(err), vim.log.levels.ERROR)
         return
       end
       self:_pause(nil, cb)
@@ -1707,7 +1715,7 @@ function Session:restart_frame()
     clear_running(self)
     local err = self:request('restartFrame', { frameId = frame.id })
     if err then
-      utils.notify('Error on restart_frame: ' .. utils.fmt_error(err), vim.log.levels.ERROR)
+      utils.notify('Error on restart_frame: ' .. tostring(err), vim.log.levels.ERROR)
     end
   end)()
 end
@@ -1744,7 +1752,7 @@ function Session:_step(step, params)
     clear_running(self, thread_id)
     self:request(step, params, function(err)
       if err then
-        utils.notify('Error on '.. step .. ': ' .. utils.fmt_error(err), vim.log.levels.ERROR)
+        utils.notify('Error on '.. step .. ': ' .. tostring(err), vim.log.levels.ERROR)
       end
       progress.report('Running')
     end)
@@ -1841,33 +1849,36 @@ end
 
 
 --- Send a request to the debug adapter
----@param command string command to execute
----@param arguments any|nil object containing arguments for the command
----@param callback fun(err: table, result: any)|nil called with the response result.
---- If nil and running within a coroutine the function will yield the result
-function Session:request(command, arguments, callback)
+---
+---@param command string command name
+---@param arguments any? command arguments
+---@param on_result fun(err: dap.ErrorResponse?, result: any)? response callback
+---@return dap.ErrorResponse? err, any response # (if running in coroutine and on_response is empty)
+---@overload fun(self: dap.Session, command: "evaluate", arguments: dap.EvaluateArguments, on_result: fun(err: dap.ErrorResponse?, result: dap.EvaluateResponse?)?):(dap.ErrorResponse?, dap.EvaluateResponse?)
+---@overload fun(self: dap.Session, command: "variables", arguments: dap.VariablesArguments, on_result: fun(err: dap.ErrorResponse?, result: dap.VariableResponse?)?):(dap.ErrorResponse?, dap.VariableResponse?)
+function Session:request(command, arguments, on_result)
   local payload = {
-    seq = self.seq;
-    type = 'request';
-    command = command;
-    arguments = arguments
+    seq = self.seq,
+    type = 'request',
+    command = command,
+    arguments = arguments,
   }
   log:debug('request', payload)
   local current_seq = self.seq
   self.seq = self.seq + 1
-  local co
-  if not callback then
-    co = coroutine.running()
-    if co then
-      callback = coresume(co)
+  local co, is_main
+  if not on_result then
+    co, is_main = coroutine.running()
+    if co and not is_main then
+      on_result = coresume(co)
     else
       -- Assume missing callback is intentional.
       -- Prevent error logging in Session:handle_body
-      callback = function(_, _)
+      on_result = function(_, _)
       end
     end
   end
-  self.message_callbacks[current_seq] = callback
+  self.message_callbacks[current_seq] = on_result
   self.message_requests[current_seq] = arguments
   send_payload(self.client, payload)
   if co then
@@ -1893,10 +1904,11 @@ function Session:initialize(config)
   vim.schedule(repl.clear)
   local adapter_responded = false
 
+  ---@param err0 dap.ErrorResponse?
   ---@param result dap.Capabilities?
   local function on_initialize(err0, result)
     if err0 then
-      utils.notify('Could not initialize debug adapter: ' .. utils.fmt_error(err0), vim.log.levels.ERROR)
+      utils.notify('Could not initialize debug adapter: ' .. tostring(err0), vim.log.levels.ERROR)
       adapter_responded = true
       return
     end
@@ -1904,7 +1916,7 @@ function Session:initialize(config)
     self:request(config.request, config, function(err)
       adapter_responded = true
       if err then
-        utils.notify(string.format('Error on %s: %s', config.request, utils.fmt_error(err)), vim.log.levels.ERROR)
+        utils.notify(string.format('Error on %s: %s', config.request, err), vim.log.levels.ERROR)
         self:close()
       end
     end)
@@ -1955,7 +1967,7 @@ function Session:evaluate(args, fn)
     }
   end
   args.frameId = args.frameId or (self.current_frame or {}).id
-  return self:request('evaluate', args, fn)
+  return self:request("evaluate", args, fn)
 end
 
 
